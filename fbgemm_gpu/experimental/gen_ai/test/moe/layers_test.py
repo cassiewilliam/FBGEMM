@@ -1,5 +1,5 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and
+# affiliates. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -13,7 +13,7 @@ import tempfile
 import traceback
 from datetime import datetime
 from functools import partial
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 
@@ -33,7 +33,7 @@ from torch.distributed.launcher.api import LaunchConfig
 # pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
 from torch.profiler import profile, ProfilerActivity
 
-from .parallelism import (
+from parallelism import (
     get_ep_group,
     get_global_rank,
     get_routed_experts_mp_group,
@@ -43,6 +43,17 @@ from .parallelism import (
 TRACE_DIR: str = "/tmp/"
 WARM_UP_ITERS = 15
 PROFILE_ITERS = 20
+
+
+def setup_logging():
+    """Configure logging for both parent and child processes."""
+    rank = int(os.environ.get("RANK", -1))
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[%(asctime)s] [rank={rank}] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,  # ensure child processes override default handlers
+    )
 
 
 def kineto_trace_handler(
@@ -55,24 +66,48 @@ def kineto_trace_handler(
     logging.info(f"trace saved to {TRACE_PATH} ")
 
 
-def get_launch_config() -> LaunchConfig:
+def _count_visible_gpus() -> int:
+    """Prefer CUDA_VISIBLE_DEVICES if set, otherwise torch.cuda.device_count()."""
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        g = [x for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if x.strip() != ""]
+        return len(g)
+    try:
+        return torch.cuda.device_count()
+    except Exception:
+        return 0
+
+
+def get_launch_config(args: Optional[argparse.Namespace] = None) -> LaunchConfig:
+    """
+    Choose nproc_per_node based on visible GPUs, and (if provided) cap to mp*ep.
+    This guarantees we only spawn the intended number of workers (e.g., 4).
+    """
+    nvis = max(1, _count_visible_gpus())
+    nproc = nvis
+
+    if args is not None:
+        try:
+            target_ws = int(getattr(args, "mp_size")) * int(getattr(args, "ep_size"))
+            if target_ws > 0:
+                nproc = min(nproc, target_ws)
+        except Exception:
+            pass
+
+    # Rendezvous on localhost fixed port for simplicity in single-node runs
     return LaunchConfig(
         min_nodes=1,
         max_nodes=1,
-        nproc_per_node=8,
-        rdzv_backend=("c10d"),
-        rdzv_endpoint="localhost:0",
-        rdzv_configs={
-            "is_host": True,
-            "rank": 0,
-        },
+        nproc_per_node=nproc,
+        rdzv_backend="c10d",
+        rdzv_endpoint="127.0.0.1:29500",
         run_id="DEFAULT_RUN_ID",
-        max_restarts=1,
+        max_restarts=0,          # no automatic restart; fail fast
         start_method="spawn",
     )
 
 
 def run_demo(cmd_args: argparse.Namespace) -> None:
+    setup_logging()  # ensure child processes emit logs
     kwargs = dict(vars(cmd_args))
     use_static_shape = kwargs.pop("use_static_shape")
     profiling = kwargs.pop("profiling")
@@ -80,6 +115,7 @@ def run_demo(cmd_args: argparse.Namespace) -> None:
 
     moe_args = MoEArgs(**kwargs)
     try:
+        # Initialize parallel groups (MP/EP)
         init_parallel(
             moe_args.mp_size,
             moe_args.ep_size,
@@ -87,7 +123,7 @@ def run_demo(cmd_args: argparse.Namespace) -> None:
         )
 
         global_rank = get_global_rank()
-        logging.info(f"Running demo in child process at {global_rank=}.")
+        logging.info(f"Running demo in child process at global_rank={global_rank}.")
 
         ep_group = get_ep_group()
         mp_group = get_routed_experts_mp_group()
@@ -129,8 +165,8 @@ def run_demo(cmd_args: argparse.Namespace) -> None:
         else:
             assert moe_args.precision == "fp8_rowwise"
             init_methods = {name: fp8_rowwise_init_method for name in param_names}
-            # pyre-ignore[6]
-            init_methods["router_DE"] = default_init_method
+            # router should remain in higher precision init
+            init_methods["router_DE"] = default_init_method  # type: ignore[index]
 
         baseline_moe = BaselineMoE(
             ep_group=ep_group,
@@ -153,26 +189,25 @@ def run_demo(cmd_args: argparse.Namespace) -> None:
         torch.nn.init.trunc_normal_(tokens, std=0.1, a=-0.2, b=0.2)
 
         # SharedExperts MP is the same as RoutedExperts MP.
+        src = torch.distributed.get_global_rank(mp_group, 0)
+        mp_world = torch.distributed.get_world_size(mp_group)
+        logging.info(f"mp_group size={mp_world}, src(global)={src}")
         torch.distributed.broadcast(
             tokens,
-            src=torch.distributed.get_global_rank(mp_group, 0),
+            src=src,
             group=mp_group,
         )
 
         baseline_output = baseline_moe(tokens, use_static_shape=use_static_shape)
-        torch.distributed.all_reduce(
-            baseline_output,
-            group=mp_group,
-        )
+        torch.distributed.all_reduce(baseline_output, group=mp_group)
 
         shuffling_output = shuffling_moe(tokens, use_static_shape=use_static_shape)
-        torch.distributed.all_reduce(
-            shuffling_output,
-            group=mp_group,
-        )
+        torch.distributed.all_reduce(shuffling_output, group=mp_group)
 
         logging.info(
-            f"{global_rank=}, {baseline_output.norm()=}, {shuffling_output.norm()=}"
+            f"global_rank={global_rank}, "
+            f"baseline_output.norm()={float(baseline_output.norm())}, "
+            f"shuffling_output.norm()={float(shuffling_output.norm())}"
         )
 
         if moe_args.precision == "bf16":
@@ -211,17 +246,27 @@ def run_demo(cmd_args: argparse.Namespace) -> None:
 
             run_profiling(baseline_moe, "baseline")
             run_profiling(shuffling_moe, "shuffling")
+
         logging.info(f"Successed to run demo with {cmd_args}!")
 
     except Exception as e:
-        logging.info(f"Failed to run demo with {cmd_args}! Reason: {e}.")
-        logging.info(traceback.format_exc())
-
-    torch.distributed.destroy_process_group()
+        # include traceback in logs
+        logging.exception(f"Failed to run demo with {cmd_args}! Reason: {e}.")
+    finally:
+        # Safe teardown to avoid 'pg is None' assertion
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.barrier()
+            except Exception:
+                pass
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    setup_logging()  # parent process logging
     parser = argparse.ArgumentParser(
         description="Arguments for testing MetaShuffling MoE."
     )
@@ -236,7 +281,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=16384)
     parser.add_argument("--num-experts", "-e", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=1)
-    parser.add_argument("--mp-size", type=int, default=4)
+    parser.add_argument("--mp-size", type=int, default=2)
     parser.add_argument("--ep-size", type=int, default=2)
     parser.add_argument("--mp-size-for-routed-experts", type=int)
     parser.add_argument("--use-static-shape", type=bool, default=False)
@@ -247,7 +292,9 @@ def main() -> None:
     parser.add_argument("--profiling", "-p", action="store_true", default=False)
 
     args = parser.parse_args()
+
     if args.testing:
+        # grid search example; still keeps world_size consistent
         setting_dict = {
             "precision": ["bf16", "fp8_rowwise"],
             "dim": [5120],
@@ -262,18 +309,19 @@ def main() -> None:
         for setting in itertools.product(*setting_dict.values()):
             for name, value in zip(setting_dict.keys(), setting):
                 setattr(args, name, value)
-            # TODO: Cleanup this hardcoded setting.
-            world_size = 8
+            # world_size follows mp*ep; here force 4 for quick tests
+            world_size = 4
             args.mp_size = world_size // args.ep_size
             args.mp_size_for_routed_experts = args.mp_size
 
             with tempfile.TemporaryDirectory():
-                launcher.elastic_launch(get_launch_config(), entrypoint=run_demo)(args)
-
+                launcher.elastic_launch(get_launch_config(args), entrypoint=run_demo)(
+                    args
+                )
             break
     else:
         with tempfile.TemporaryDirectory():
-            launcher.elastic_launch(get_launch_config(), entrypoint=run_demo)(args)
+            launcher.elastic_launch(get_launch_config(args), entrypoint=run_demo)(args)
 
 
 if __name__ == "__main__":
